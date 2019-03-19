@@ -30,7 +30,7 @@
 use std::cmp;
 
 use ethereum_types::U256;
-use txpool::{self, scoring};
+use txpool::{self, scoring, Ready, Readiness};
 use super::{verifier, PrioritizationStrategy, VerifiedTransaction, ScoredTransaction};
 
 /// Transaction with the same (sender, nonce) can be replaced only if
@@ -122,7 +122,7 @@ impl<P> txpool::Scoring<P> for NonceAndGasPrice where P: ScoredTransaction + txp
 		}
 	}
 
-	fn should_replace(&self, old: &P, new: &P) -> scoring::Choice {
+	fn should_replace<R: Ready<P>>(&self, old: &P, new: &P, ready: &mut R) -> scoring::Choice {
 		let both_local = old.priority().is_local() && new.priority().is_local();
 		if old.sender() == new.sender() {
 			// prefer earliest transaction
@@ -138,7 +138,14 @@ impl<P> txpool::Scoring<P> for NonceAndGasPrice where P: ScoredTransaction + txp
 			let old_score = (old.priority(), old.gas_price());
 			let new_score = (new.priority(), new.gas_price());
 			if new_score > old_score {
-				scoring::Choice::ReplaceOld
+				let old_readiness = ready.is_ready(&old);
+				let new_readiness = ready.is_ready(&new);
+				if old_readiness == Readiness::Ready && new_readiness != Readiness::Ready {
+					// ready transactions should not be replaced by non ready
+					scoring::Choice::RejectNew
+				} else {
+					scoring::Choice::ReplaceOld
+				}
 			} else {
 				scoring::Choice::RejectNew
 			}
@@ -155,15 +162,51 @@ mod tests {
 	use super::*;
 
 	use std::sync::Arc;
+	use std::collections::HashMap;
+	use ethereum_types::{H160 as Sender, U256};
 	use ethkey::{Random, Generator, KeyPair};
 	use pool::tests::tx::{Tx, TxExt};
 	use txpool::Scoring;
 	use txpool::scoring::Choice::*;
 
+	#[derive(Default)]
+	pub struct NonceReady(HashMap<Sender, U256>, U256);
+
+	impl NonceReady {
+		fn new<T: Into<U256>>(min: T) -> Self {
+			let mut n = NonceReady::default();
+			n.1 = min.into();
+			n
+		}
+	}
+
+	impl Ready<VerifiedTransaction> for NonceReady {
+		fn is_ready(&mut self, tx: &VerifiedTransaction) -> Readiness {
+			let min = self.1;
+			let nonce = self.0.entry(tx.sender).or_insert_with(|| min);
+			match tx.nonce().cmp(nonce) {
+				cmp::Ordering::Greater => Readiness::Future,
+				cmp::Ordering::Equal => {
+					*nonce += 1.into();
+					Readiness::Ready
+				},
+				cmp::Ordering::Less => Readiness::Stale,
+			}
+		}
+	}
+
 	fn local_tx_verified(tx: Tx, keypair: &KeyPair) -> VerifiedTransaction {
 		let mut verified_tx = tx.unsigned().sign(keypair.secret(), None).verified();
 		verified_tx.priority = ::pool::Priority::Local;
 		verified_tx
+	}
+
+	fn should_replace(
+		scoring: &NonceAndGasPrice,
+		old: &VerifiedTransaction,
+		new: &VerifiedTransaction,
+	) -> scoring::Choice {
+		scoring.should_replace(old, new, &mut NonceReady::new(1))
 	}
 
 	#[test]
@@ -204,15 +247,15 @@ mod tests {
 			..Default::default()
 		}, &Random.generate().unwrap());
 
-		assert_eq!(scoring.should_replace(&same_sender_tx1, &same_sender_tx2), InsertNew);
-		assert_eq!(scoring.should_replace(&same_sender_tx2, &same_sender_tx1), InsertNew);
+		assert_eq!(should_replace(&scoring, &same_sender_tx1, &same_sender_tx2), InsertNew);
+		assert_eq!(should_replace(&scoring, &same_sender_tx2, &same_sender_tx1), InsertNew);
 
-		assert_eq!(scoring.should_replace(&different_sender_tx1, &different_sender_tx2), InsertNew);
-		assert_eq!(scoring.should_replace(&different_sender_tx2, &different_sender_tx1), InsertNew);
+		assert_eq!(should_replace(&scoring, &different_sender_tx1, &different_sender_tx2), InsertNew);
+		assert_eq!(should_replace(&scoring, &different_sender_tx2, &different_sender_tx1), InsertNew);
 
 		// txs with same sender and nonce
-		assert_eq!(scoring.should_replace(&same_sender_tx2, &same_sender_tx3), ReplaceOld);
-		assert_eq!(scoring.should_replace(&same_sender_tx3, &same_sender_tx2), RejectNew);
+		assert_eq!(should_replace(&scoring, &same_sender_tx2, &same_sender_tx3), ReplaceOld);
+		assert_eq!(should_replace(&scoring, &same_sender_tx3, &same_sender_tx2), RejectNew);
 	}
 
 	#[test]
@@ -245,14 +288,14 @@ mod tests {
 			tx.unsigned().sign(keypair.secret(), None).verified()
 		}).collect::<Vec<_>>();
 
-		assert_eq!(scoring.should_replace(&txs[0], &txs[1]), RejectNew);
-		assert_eq!(scoring.should_replace(&txs[1], &txs[0]), ReplaceOld);
+		assert_eq!(should_replace(&scoring, &txs[0], &txs[1]), RejectNew);
+		assert_eq!(should_replace(&scoring, &txs[1], &txs[0]), ReplaceOld);
 
-		assert_eq!(scoring.should_replace(&txs[1], &txs[2]), RejectNew);
-		assert_eq!(scoring.should_replace(&txs[2], &txs[1]), RejectNew);
+		assert_eq!(should_replace(&scoring, &txs[1], &txs[2]), RejectNew);
+		assert_eq!(should_replace(&scoring, &txs[2], &txs[1]), RejectNew);
 
-		assert_eq!(scoring.should_replace(&txs[1], &txs[3]), ReplaceOld);
-		assert_eq!(scoring.should_replace(&txs[3], &txs[1]), RejectNew);
+		assert_eq!(should_replace(&scoring, &txs[1], &txs[3]), ReplaceOld);
+		assert_eq!(should_replace(&scoring, &txs[3], &txs[1]), RejectNew);
 	}
 
 	#[test]
@@ -296,14 +339,37 @@ mod tests {
 			verified_tx
 		};
 
-		assert_eq!(scoring.should_replace(&tx_regular_low_gas, &tx_regular_high_gas), ReplaceOld);
-		assert_eq!(scoring.should_replace(&tx_regular_high_gas, &tx_regular_low_gas), RejectNew);
+		assert_eq!(should_replace(&scoring, &tx_regular_low_gas, &tx_regular_high_gas), ReplaceOld);
+		assert_eq!(should_replace(&scoring, &tx_regular_high_gas, &tx_regular_low_gas), RejectNew);
 
-		assert_eq!(scoring.should_replace(&tx_regular_high_gas, &tx_local_low_gas), ReplaceOld);
-		assert_eq!(scoring.should_replace(&tx_local_low_gas, &tx_regular_high_gas), RejectNew);
+		assert_eq!(should_replace(&scoring, &tx_regular_high_gas, &tx_local_low_gas), ReplaceOld);
+		assert_eq!(should_replace(&scoring, &tx_local_low_gas, &tx_regular_high_gas), RejectNew);
 
-		assert_eq!(scoring.should_replace(&tx_local_low_gas, &tx_local_high_gas), InsertNew);
-		assert_eq!(scoring.should_replace(&tx_local_high_gas, &tx_regular_low_gas), RejectNew);
+		assert_eq!(should_replace(&scoring, &tx_local_low_gas, &tx_local_high_gas), InsertNew);
+		assert_eq!(should_replace(&scoring, &tx_local_high_gas, &tx_regular_low_gas), RejectNew);
+	}
+
+	#[test]
+	fn should_not_replace_ready_transaction_with_future_transaction() {
+		let scoring = NonceAndGasPrice(PrioritizationStrategy::GasPriceOnly);
+		let tx_ready_low_score = {
+			let tx = Tx {
+				nonce: 1,
+				gas_price: 1,
+				..Default::default()
+			};
+			tx.signed().verified()
+		};
+		let tx_future_high_score = {
+			let tx = Tx {
+				nonce: 3, // future nonce
+				gas_price: 10,
+				..Default::default()
+			};
+			tx.signed().verified()
+		};
+
+		assert_eq!(should_replace(&scoring, &tx_ready_low_score, &tx_future_high_score), RejectNew);
 	}
 
 	#[test]

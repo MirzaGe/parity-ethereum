@@ -31,6 +31,7 @@ use pool::{
 	PrioritizationStrategy, PendingOrdering, PendingSettings,
 };
 use pool::local_transactions::LocalTransactionsList;
+use pool::client::NonceClient;
 
 type Listener = (LocalTransactionsList, (listener::Notifier, listener::Logger));
 type Pool = txpool::Pool<pool::VerifiedTransaction, scoring::NonceAndGasPrice, Listener>;
@@ -240,7 +241,7 @@ impl TransactionQueue {
 	///
 	/// Given blockchain and state access (Client)
 	/// verifies and imports transactions to the pool.
-	pub fn import<C: client::Client>(
+	pub fn import<C: client::Client + NonceClient + Clone>(
 		&self,
 		client: C,
 		transactions: Vec<verifier::Transaction>,
@@ -263,11 +264,13 @@ impl TransactionQueue {
 		};
 
 		let verifier = verifier::Verifier::new(
-			client,
+			client.clone(),
 			options,
 			self.insertion_id.clone(),
 			transaction_to_replace,
 		);
+
+		let mut state_readiness = ready::State::new(client, None, None);
 
 		let results = transactions
 			.into_iter()
@@ -286,7 +289,7 @@ impl TransactionQueue {
 				let imported = verifier
 					.verify_transaction(transaction)
 					.and_then(|verified| {
-						self.pool.write().import(verified).map_err(convert_error)
+						self.pool.write().import(verified, &mut state_readiness).map_err(convert_error)
 					});
 
 				match imported {
@@ -586,10 +589,6 @@ fn convert_error<H: fmt::Debug + fmt::LowerHex>(err: txpool::Error<H>) -> transa
 		Error::AlreadyImported(..) => transaction::Error::AlreadyImported,
 		Error::TooCheapToEnter(..) => transaction::Error::LimitReached,
 		Error::TooCheapToReplace(..) => transaction::Error::TooCheapToReplace,
-		ref e => {
-			warn!(target: "txqueue", "Unknown import error: {:?}", e);
-			transaction::Error::NotAllowed
-		},
 	}
 }
 
