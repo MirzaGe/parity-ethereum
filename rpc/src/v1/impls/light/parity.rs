@@ -191,7 +191,6 @@ where
 	}
 
 	fn phrase_to_address(&self, phrase: String) -> Result<H160> {
-		// TODO(niklasad1): replace `unwrap`
 		Ok(Brain::new(phrase).generate().expect("Brain::generate always returns Ok; qed").address())
 	}
 
